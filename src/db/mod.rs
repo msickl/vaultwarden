@@ -300,19 +300,17 @@ pub trait FromDb {
 
 impl<T: FromDb> FromDb for Vec<T> {
     type Output = Vec<T::Output>;
-    #[allow(clippy::wrong_self_convention)]
     #[inline(always)]
     fn from_db(self) -> Self::Output {
-        self.into_iter().map(crate::db::FromDb::from_db).collect()
+        self.into_iter().map(FromDb::from_db).collect()
     }
 }
 
 impl<T: FromDb> FromDb for Option<T> {
     type Output = Option<T::Output>;
-    #[allow(clippy::wrong_self_convention)]
     #[inline(always)]
     fn from_db(self) -> Self::Output {
-        self.map(crate::db::FromDb::from_db)
+        self.map(FromDb::from_db)
     }
 }
 
@@ -375,22 +373,16 @@ pub async fn backup_database(conn: &mut DbConn) -> Result<String, Error> {
             err!("PostgreSQL and MySQL/MariaDB do not support this backup feature");
         }
         sqlite {
-            backup_sqlite_database(conn)
+            let db_url = CONFIG.database_url();
+            let db_path = std::path::Path::new(&db_url).parent().unwrap();
+            let backup_file = db_path
+                .join(format!("db_{}.sqlite3", chrono::Utc::now().format("%Y%m%d_%H%M%S")))
+                .to_string_lossy()
+                .into_owned();
+            diesel::sql_query(format!("VACUUM INTO '{backup_file}'")).execute(conn)?;
+            Ok(backup_file)
         }
     }
-}
-
-#[cfg(sqlite)]
-pub fn backup_sqlite_database(conn: &mut diesel::sqlite::SqliteConnection) -> Result<String, Error> {
-    use diesel::RunQueryDsl;
-    let db_url = CONFIG.database_url();
-    let db_path = std::path::Path::new(&db_url).parent().unwrap();
-    let backup_file = db_path
-        .join(format!("db_{}.sqlite3", chrono::Utc::now().format("%Y%m%d_%H%M%S")))
-        .to_string_lossy()
-        .into_owned();
-    diesel::sql_query(format!("VACUUM INTO '{backup_file}'")).execute(conn)?;
-    Ok(backup_file)
 }
 
 /// Get the SQL Server version
