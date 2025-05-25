@@ -102,7 +102,7 @@ const ACTING_ADMIN_USER: &str = "vaultwarden-admin-00000-000000000000";
 pub const FAKE_ADMIN_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
 fn admin_path() -> String {
-    format!("{}{}", CONFIG.domain_path(), ADMIN_PATH)
+    format!("{}{ADMIN_PATH}", CONFIG.domain_path())
 }
 
 #[derive(Debug)]
@@ -206,7 +206,7 @@ fn post_admin_login(
 
         cookies.add(cookie);
         if let Some(redirect) = redirect {
-            Ok(Redirect::to(format!("{}{}", admin_path(), redirect)))
+            Ok(Redirect::to(format!("{}{redirect}", admin_path())))
         } else {
             Err(AdminResponse::Ok(render_admin_page()))
         }
@@ -427,7 +427,7 @@ async fn deauth_user(user_id: UserId, _token: AdminToken, mut conn: DbConn, nt: 
         for device in Device::find_push_devices_by_user(&user.uuid, &mut conn).await {
             match unregister_push_device(device.push_uuid).await {
                 Ok(r) => r,
-                Err(e) => error!("Unable to unregister devices from Bitwarden server: {}", e),
+                Err(e) => error!("Unable to unregister devices from Bitwarden server: {e}"),
             };
         }
     }
@@ -618,7 +618,7 @@ async fn has_http_access() -> bool {
 use cached::proc_macro::cached;
 /// Cache this function to prevent API call rate limit. Github only allows 60 requests per hour, and we use 3 here already.
 /// It will cache this function for 300 seconds (5 minutes) which should prevent the exhaustion of the rate limit.
-#[cached(time = 300, sync_writes = true)]
+#[cached(time = 300, sync_writes = "default")]
 async fn get_release_info(has_http_access: bool, running_within_container: bool) -> (String, String, String) {
     // If the HTTP Check failed, do not even attempt to check for new versions since we were not able to connect with github.com anyway.
     if has_http_access {

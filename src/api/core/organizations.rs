@@ -10,10 +10,7 @@ use crate::{
         core::{log_event, two_factor, CipherSyncData, CipherSyncType},
         EmptyResult, JsonResult, Notify, PasswordOrOtpData, UpdateType,
     },
-    auth::{
-        decode_invite, AdminHeaders, ClientVersion, Headers, ManagerHeaders, ManagerHeadersLoose, OrgMemberHeaders,
-        OwnerHeaders,
-    },
+    auth::{decode_invite, AdminHeaders, Headers, ManagerHeaders, ManagerHeadersLoose, OrgMemberHeaders, OwnerHeaders},
     db::{models::*, DbConn},
     mail,
     util::{convert_json_key_lcase_first, NumberOrString},
@@ -997,8 +994,6 @@ struct InviteData {
     r#type: NumberOrString,
     collections: Option<Vec<CollectionData>>,
     #[serde(default)]
-    access_all: bool,
-    #[serde(default)]
     permissions: HashMap<String, Value>,
 }
 
@@ -1012,7 +1007,7 @@ async fn send_invite(
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
-    let mut data: InviteData = data.into_inner();
+    let data: InviteData = data.into_inner();
 
     // HACK: We need the raw user-type to be sure custom role is selected to determine the access_all permission
     // The from_str() will convert the custom role type into a manager role type
@@ -1030,13 +1025,11 @@ async fn send_invite(
     // HACK: This converts the Custom role which has the `Manage all collections` box checked into an access_all flag
     // Since the parent checkbox is not sent to the server we need to check and verify the child checkboxes
     // If the box is not checked, the user will still be a manager, but not with the access_all permission
-    if raw_type.eq("4")
-        && data.permissions.get("editAnyCollection") == Some(&json!(true))
-        && data.permissions.get("deleteAnyCollection") == Some(&json!(true))
-        && data.permissions.get("createNewCollections") == Some(&json!(true))
-    {
-        data.access_all = true;
-    }
+    let access_all = new_type >= MembershipType::Admin
+        || (raw_type.eq("4")
+            && data.permissions.get("editAnyCollection") == Some(&json!(true))
+            && data.permissions.get("deleteAnyCollection") == Some(&json!(true))
+            && data.permissions.get("createNewCollections") == Some(&json!(true)));
 
     let mut user_created: bool = false;
     for email in data.emails.iter() {
@@ -1074,7 +1067,6 @@ async fn send_invite(
         };
 
         let mut new_member = Membership::new(user.uuid.clone(), org_id.clone());
-        let access_all = data.access_all;
         new_member.access_all = access_all;
         new_member.atype = new_type;
         new_member.status = member_status;
@@ -1525,8 +1517,6 @@ struct EditUserData {
     collections: Option<Vec<CollectionData>>,
     groups: Option<Vec<GroupId>>,
     #[serde(default)]
-    access_all: bool,
-    #[serde(default)]
     permissions: HashMap<String, Value>,
 }
 
@@ -1552,7 +1542,7 @@ async fn edit_member(
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
-    let mut data: EditUserData = data.into_inner();
+    let data: EditUserData = data.into_inner();
 
     // HACK: We need the raw user-type to be sure custom role is selected to determine the access_all permission
     // The from_str() will convert the custom role type into a manager role type
@@ -1565,13 +1555,11 @@ async fn edit_member(
     // HACK: This converts the Custom role which has the `Manage all collections` box checked into an access_all flag
     // Since the parent checkbox is not sent to the server we need to check and verify the child checkboxes
     // If the box is not checked, the user will still be a manager, but not with the access_all permission
-    if raw_type.eq("4")
-        && data.permissions.get("editAnyCollection") == Some(&json!(true))
-        && data.permissions.get("deleteAnyCollection") == Some(&json!(true))
-        && data.permissions.get("createNewCollections") == Some(&json!(true))
-    {
-        data.access_all = true;
-    }
+    let access_all = new_type >= MembershipType::Admin
+        || (raw_type.eq("4")
+            && data.permissions.get("editAnyCollection") == Some(&json!(true))
+            && data.permissions.get("deleteAnyCollection") == Some(&json!(true))
+            && data.permissions.get("createNewCollections") == Some(&json!(true)));
 
     let mut member_to_edit = match Membership::find_by_uuid_and_org(&member_id, &org_id, &mut conn).await {
         Some(member) => member,
@@ -1617,7 +1605,7 @@ async fn edit_member(
         }
     }
 
-    member_to_edit.access_all = data.access_all;
+    member_to_edit.access_all = access_all;
     member_to_edit.atype = new_type as i32;
 
     // Delete all the odd collections
@@ -1626,7 +1614,7 @@ async fn edit_member(
     }
 
     // If no accessAll, add the collections received
-    if !data.access_all {
+    if !access_all {
         for col in data.collections.iter().flatten() {
             match Collection::find_by_uuid_and_org(&col.id, &org_id, &mut conn).await {
                 None => err!("Collection not found in Organization"),
@@ -3278,57 +3266,19 @@ async fn put_reset_password_enrollment(
     Ok(())
 }
 
-// This is a new function active since the v2022.9.x clients.
-// It combines the previous two calls done before.
-// We call those two functions here and combine them ourselves.
-//
 // NOTE: It seems clients can't handle uppercase-first keys!!
 //       We need to convert all keys so they have the first character to be a lowercase.
 //       Else the export will be just an empty JSON file.
 #[get("/organizations/<org_id>/export")]
-async fn get_org_export(
-    org_id: OrganizationId,
-    headers: AdminHeaders,
-    client_version: Option<ClientVersion>,
-    mut conn: DbConn,
-) -> JsonResult {
+async fn get_org_export(org_id: OrganizationId, headers: AdminHeaders, mut conn: DbConn) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
-    // Since version v2023.1.0 the format of the export is different.
-    // Also, this endpoint was created since v2022.9.0.
-    // Therefore, we will check for any version smaller then v2023.1.0 and return a different response.
-    // If we can't determine the version, we will use the latest default v2023.1.0 and higher.
-    // https://github.com/bitwarden/server/blob/9ca93381ce416454734418c3a9f99ab49747f1b6/src/Api/Controllers/OrganizationExportController.cs#L44
-    let use_list_response_model = if let Some(client_version) = client_version {
-        let ver_match = semver::VersionReq::parse("<2023.1.0").unwrap();
-        ver_match.matches(&client_version.0)
-    } else {
-        false
-    };
 
-    // Also both main keys here need to be lowercase, else the export will fail.
-    if use_list_response_model {
-        // Backwards compatible pre v2023.1.0 response
-        Ok(Json(json!({
-            "collections": {
-                "data": convert_json_key_lcase_first(_get_org_collections(&org_id, &mut conn).await),
-                "object": "list",
-                "continuationToken": null,
-            },
-            "ciphers": {
-                "data": convert_json_key_lcase_first(_get_org_details(&org_id, &headers.host, &headers.user.uuid, &mut conn).await),
-                "object": "list",
-                "continuationToken": null,
-            }
-        })))
-    } else {
-        // v2023.1.0 and newer response
-        Ok(Json(json!({
-            "collections": convert_json_key_lcase_first(_get_org_collections(&org_id, &mut conn).await),
-            "ciphers": convert_json_key_lcase_first(_get_org_details(&org_id, &headers.host, &headers.user.uuid, &mut conn).await),
-        })))
-    }
+    Ok(Json(json!({
+        "collections": convert_json_key_lcase_first(_get_org_collections(&org_id, &mut conn).await),
+        "ciphers": convert_json_key_lcase_first(_get_org_details(&org_id, &headers.host, &headers.user.uuid, &mut conn).await),
+    })))
 }
 
 async fn _api_key(

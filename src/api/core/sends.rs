@@ -338,7 +338,7 @@ async fn post_send_file_v2(data: Json<SendData>, headers: Headers, mut conn: DbC
     Ok(Json(json!({
         "fileUploadType": 0, // 0 == Direct | 1 == Azure
         "object": "send-fileUpload",
-        "url": format!("/sends/{}/file/{}", send.uuid, file_id),
+        "url": format!("/sends/{}/file/{file_id}", send.uuid),
         "sendResponse": send.to_json()
     })))
 }
@@ -378,7 +378,11 @@ async fn post_send_file_v2_data(
     };
 
     match data.data.raw_name() {
-        Some(raw_file_name) if raw_file_name.dangerous_unsafe_unsanitized_raw() == send_data.fileName => (),
+        Some(raw_file_name)
+            if raw_file_name.dangerous_unsafe_unsanitized_raw() == send_data.fileName
+            // be less strict only if using CLI, cf. https://github.com/dani-garcia/vaultwarden/issues/5614
+            || (headers.device.is_cli() && send_data.fileName.ends_with(raw_file_name.dangerous_unsafe_unsanitized_raw().as_str())
+            ) => {}
         Some(raw_file_name) => err!(
             "Send file name does not match.",
             format!(
@@ -552,7 +556,7 @@ async fn post_access_file(
     Ok(Json(json!({
         "object": "send-fileDownload",
         "id": file_id,
-        "url": format!("{}/api/sends/{}/{}?t={}", &host.host, send_id, file_id, token)
+        "url": format!("{}/api/sends/{send_id}/{file_id}?t={token}", &host.host)
     })))
 }
 

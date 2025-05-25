@@ -24,7 +24,7 @@ use crate::{
 };
 
 pub fn routes() -> Vec<Route> {
-    routes![login, prelogin, identity_register]
+    routes![login, prelogin, identity_register, register_verification_email, register_finish]
 }
 
 #[post("/connect/token", data = "<data>")]
@@ -158,7 +158,7 @@ async fn _password_login(
     // Get the user
     let username = data.username.as_ref().unwrap().trim();
     let Some(mut user) = User::find_by_mail(username, conn).await else {
-        err!("Username or password is incorrect. Try again", format!("IP: {}. Username: {}.", ip.ip, username))
+        err!("Username or password is incorrect. Try again", format!("IP: {}. Username: {username}.", ip.ip))
     };
 
     // Set the user_id here to be passed back used for event logging.
@@ -168,7 +168,7 @@ async fn _password_login(
     if !user.enabled {
         err!(
             "This user has been disabled",
-            format!("IP: {}. Username: {}.", ip.ip, username),
+            format!("IP: {}. Username: {username}.", ip.ip),
             ErrorEvent {
                 event: EventType::UserFailedLogIn
             }
@@ -182,7 +182,7 @@ async fn _password_login(
         let Some(auth_request) = AuthRequest::find_by_uuid_and_user(auth_request_id, &user.uuid, conn).await else {
             err!(
                 "Auth request not found. Try again.",
-                format!("IP: {}. Username: {}.", ip.ip, username),
+                format!("IP: {}. Username: {username}.", ip.ip),
                 ErrorEvent {
                     event: EventType::UserFailedLogIn,
                 }
@@ -200,7 +200,7 @@ async fn _password_login(
         {
             err!(
                 "Username or access code is incorrect. Try again",
-                format!("IP: {}. Username: {}.", ip.ip, username),
+                format!("IP: {}. Username: {username}.", ip.ip),
                 ErrorEvent {
                     event: EventType::UserFailedLogIn,
                 }
@@ -209,7 +209,7 @@ async fn _password_login(
     } else if !user.check_valid_password(password) {
         err!(
             "Username or password is incorrect. Try again",
-            format!("IP: {}. Username: {}.", ip.ip, username),
+            format!("IP: {}. Username: {username}.", ip.ip),
             ErrorEvent {
                 event: EventType::UserFailedLogIn,
             }
@@ -222,7 +222,7 @@ async fn _password_login(
         user.set_password(password, None, false, None);
 
         if let Err(e) = user.save(conn).await {
-            error!("Error updating user: {:#?}", e);
+            error!("Error updating user: {e:#?}");
         }
     }
 
@@ -241,11 +241,11 @@ async fn _password_login(
                 user.login_verify_count += 1;
 
                 if let Err(e) = user.save(conn).await {
-                    error!("Error updating user: {:#?}", e);
+                    error!("Error updating user: {e:#?}");
                 }
 
                 if let Err(e) = mail::send_verify_email(&user.email, &user.uuid).await {
-                    error!("Error auto-sending email verification email: {:#?}", e);
+                    error!("Error auto-sending email verification email: {e:#?}");
                 }
             }
         }
@@ -253,7 +253,7 @@ async fn _password_login(
         // We still want the login to fail until they actually verified the email address
         err!(
             "Please verify your email before trying again.",
-            format!("IP: {}. Username: {}.", ip.ip, username),
+            format!("IP: {}. Username: {username}.", ip.ip),
             ErrorEvent {
                 event: EventType::UserFailedLogIn
             }
@@ -266,7 +266,7 @@ async fn _password_login(
 
     if CONFIG.mail_enabled() && new_device {
         if let Err(e) = mail::send_new_device_logged_in(&user.email, &ip.ip.to_string(), &now, &device).await {
-            error!("Error sending new device email: {:#?}", e);
+            error!("Error sending new device email: {e:#?}");
 
             if CONFIG.require_device_email() {
                 err!(
@@ -352,7 +352,7 @@ async fn _password_login(
         result["TwoFactorToken"] = Value::String(token);
     }
 
-    info!("User {} logged in successfully. IP: {}", username, ip.ip);
+    info!("User {username} logged in successfully. IP: {}", ip.ip);
     Ok(Json(result))
 }
 
@@ -420,7 +420,7 @@ async fn _user_api_key_login(
     if CONFIG.mail_enabled() && new_device {
         let now = Utc::now().naive_utc();
         if let Err(e) = mail::send_new_device_logged_in(&user.email, &ip.ip.to_string(), &now, &device).await {
-            error!("Error sending new device email: {:#?}", e);
+            error!("Error sending new device email: {e:#?}");
 
             if CONFIG.require_device_email() {
                 err!(
@@ -575,7 +575,7 @@ async fn twofactor_auth(
             }
         }
         Some(TwoFactorType::Email) => {
-            email::validate_email_code_str(&user.uuid, twofactor_code, &selected_data?, conn).await?
+            email::validate_email_code_str(&user.uuid, twofactor_code, &selected_data?, &ip.ip, conn).await?
         }
 
         Some(TwoFactorType::Remember) => {
@@ -714,7 +714,66 @@ async fn prelogin(data: Json<PreloginData>, conn: DbConn) -> Json<Value> {
 
 #[post("/accounts/register", data = "<data>")]
 async fn identity_register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
-    _register(data, conn).await
+    _register(data, false, conn).await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegisterVerificationData {
+    email: String,
+    name: Option<String>,
+    // receiveMarketingEmails: bool,
+}
+
+#[derive(rocket::Responder)]
+enum RegisterVerificationResponse {
+    NoContent(()),
+    Token(Json<String>),
+}
+
+#[post("/accounts/register/send-verification-email", data = "<data>")]
+async fn register_verification_email(
+    data: Json<RegisterVerificationData>,
+    mut conn: DbConn,
+) -> ApiResult<RegisterVerificationResponse> {
+    let data = data.into_inner();
+
+    if !CONFIG.is_signup_allowed(&data.email) {
+        err!("Registration not allowed or user already exists")
+    }
+
+    let should_send_mail = CONFIG.mail_enabled() && CONFIG.signups_verify();
+
+    let token_claims =
+        crate::auth::generate_register_verify_claims(data.email.clone(), data.name.clone(), should_send_mail);
+    let token = crate::auth::encode_jwt(&token_claims);
+
+    if should_send_mail {
+        let user = User::find_by_mail(&data.email, &mut conn).await;
+        if user.filter(|u| u.private_key.is_some()).is_some() {
+            // There is still a timing side channel here in that the code
+            // paths that send mail take noticeably longer than ones that
+            // don't. Add a randomized sleep to mitigate this somewhat.
+            use rand::{rngs::SmallRng, Rng, SeedableRng};
+            let mut rng = SmallRng::from_os_rng();
+            let delta: i32 = 100;
+            let sleep_ms = (1_000 + rng.random_range(-delta..=delta)) as u64;
+            tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
+        } else {
+            mail::send_register_verify_email(&data.email, &token).await?;
+        }
+
+        Ok(RegisterVerificationResponse::NoContent(()))
+    } else {
+        // If email verification is not required, return the token directly
+        // the clients will use this token to finish the registration
+        Ok(RegisterVerificationResponse::Token(Json(token)))
+    }
+}
+
+#[post("/accounts/register/finish", data = "<data>")]
+async fn register_finish(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
+    _register(data, true, conn).await
 }
 
 // https://github.com/bitwarden/jslib/blob/master/common/src/models/request/tokenRequest.ts
