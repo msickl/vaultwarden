@@ -14,10 +14,11 @@ use crate::{
             log_user_event,
             two_factor::{authenticator, duo, duo_oidc, email, enforce_2fa_policy, webauthn, yubikey},
         },
+        master_password_policy,
         push::register_push_device,
         ApiResult, EmptyResult, JsonResult,
     },
-    auth::{generate_organization_api_key_login_claims, ClientHeaders, ClientIp},
+    auth::{generate_organization_api_key_login_claims, ClientHeaders, ClientIp, ClientVersion},
     db::{models::*, DbConn},
     error::MapResult,
     mail, util, CONFIG,
@@ -28,7 +29,12 @@ pub fn routes() -> Vec<Route> {
 }
 
 #[post("/connect/token", data = "<data>")]
-async fn login(data: Form<ConnectData>, client_header: ClientHeaders, mut conn: DbConn) -> JsonResult {
+async fn login(
+    data: Form<ConnectData>,
+    client_header: ClientHeaders,
+    client_version: Option<ClientVersion>,
+    mut conn: DbConn,
+) -> JsonResult {
     let data: ConnectData = data.into_inner();
 
     let mut user_id: Option<UserId> = None;
@@ -48,7 +54,7 @@ async fn login(data: Form<ConnectData>, client_header: ClientHeaders, mut conn: 
             _check_is_some(&data.device_name, "device_name cannot be blank")?;
             _check_is_some(&data.device_type, "device_type cannot be blank")?;
 
-            _password_login(data, &mut user_id, &mut conn, &client_header.ip).await
+            _password_login(data, &mut user_id, &mut conn, &client_header.ip, &client_version).await
         }
         "client_credentials" => {
             _check_is_some(&data.client_id, "client_id cannot be blank")?;
@@ -112,7 +118,7 @@ async fn _refresh_login(data: ConnectData, conn: &mut DbConn) -> JsonResult {
     // See: https://github.com/dani-garcia/vaultwarden/issues/4156
     // ---
     // let members = Membership::find_confirmed_by_user(&user.uuid, conn).await;
-    let (access_token, expires_in) = device.refresh_tokens(&user, scope_vec);
+    let (access_token, expires_in) = device.refresh_tokens(&user, scope_vec, data.client_id);
     device.save(conn).await?;
 
     let result = json!({
@@ -127,23 +133,12 @@ async fn _refresh_login(data: ConnectData, conn: &mut DbConn) -> JsonResult {
     Ok(Json(result))
 }
 
-#[derive(Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MasterPasswordPolicy {
-    min_complexity: u8,
-    min_length: u32,
-    require_lower: bool,
-    require_upper: bool,
-    require_numbers: bool,
-    require_special: bool,
-    enforce_on_login: bool,
-}
-
 async fn _password_login(
     data: ConnectData,
     user_id: &mut Option<UserId>,
     conn: &mut DbConn,
     ip: &ClientIp,
+    client_version: &Option<ClientVersion>,
 ) -> JsonResult {
     // Validate scope
     let scope = data.scope.as_ref().unwrap();
@@ -262,7 +257,7 @@ async fn _password_login(
 
     let (mut device, new_device) = get_device(&data, conn, &user).await;
 
-    let twofactor_token = twofactor_auth(&user, &data, &mut device, ip, conn).await?;
+    let twofactor_token = twofactor_auth(&user, &data, &mut device, ip, client_version, conn).await?;
 
     if CONFIG.mail_enabled() && new_device {
         if let Err(e) = mail::send_new_device_logged_in(&user.email, &ip.ip.to_string(), &now, &device).await {
@@ -291,38 +286,10 @@ async fn _password_login(
     // See: https://github.com/dani-garcia/vaultwarden/issues/4156
     // ---
     // let members = Membership::find_confirmed_by_user(&user.uuid, conn).await;
-    let (access_token, expires_in) = device.refresh_tokens(&user, scope_vec);
+    let (access_token, expires_in) = device.refresh_tokens(&user, scope_vec, data.client_id);
     device.save(conn).await?;
 
-    // Fetch all valid Master Password Policies and merge them into one with all true's and larges numbers as one policy
-    let master_password_policies: Vec<MasterPasswordPolicy> =
-        OrgPolicy::find_accepted_and_confirmed_by_user_and_active_policy(
-            &user.uuid,
-            OrgPolicyType::MasterPassword,
-            conn,
-        )
-        .await
-        .into_iter()
-        .filter_map(|p| serde_json::from_str(&p.data).ok())
-        .collect();
-
-    let master_password_policy = if !master_password_policies.is_empty() {
-        let mut mpp_json = json!(master_password_policies.into_iter().reduce(|acc, policy| {
-            MasterPasswordPolicy {
-                min_complexity: acc.min_complexity.max(policy.min_complexity),
-                min_length: acc.min_length.max(policy.min_length),
-                require_lower: acc.require_lower || policy.require_lower,
-                require_upper: acc.require_upper || policy.require_upper,
-                require_numbers: acc.require_numbers || policy.require_numbers,
-                require_special: acc.require_special || policy.require_special,
-                enforce_on_login: acc.enforce_on_login || policy.enforce_on_login,
-            }
-        }));
-        mpp_json["object"] = json!("masterPasswordPolicy");
-        mpp_json
-    } else {
-        json!({"object": "masterPasswordPolicy"})
-    };
+    let master_password_policy = master_password_policy(&user, conn).await;
 
     let mut result = json!({
         "access_token": access_token,
@@ -441,7 +408,7 @@ async fn _user_api_key_login(
     // See: https://github.com/dani-garcia/vaultwarden/issues/4156
     // ---
     // let members = Membership::find_confirmed_by_user(&user.uuid, conn).await;
-    let (access_token, expires_in) = device.refresh_tokens(&user, scope_vec);
+    let (access_token, expires_in) = device.refresh_tokens(&user, scope_vec, data.client_id);
     device.save(conn).await?;
 
     info!("User {} logged in successfully via API key. IP: {}", user.email, ip.ip);
@@ -520,6 +487,7 @@ async fn twofactor_auth(
     data: &ConnectData,
     device: &mut Device,
     ip: &ClientIp,
+    client_version: &Option<ClientVersion>,
     conn: &mut DbConn,
 ) -> ApiResult<Option<String>> {
     let twofactors = TwoFactor::find_by_user(&user.uuid, conn).await;
@@ -538,7 +506,10 @@ async fn twofactor_auth(
     let twofactor_code = match data.two_factor_token {
         Some(ref code) => code,
         None => {
-            err_json!(_json_err_twofactor(&twofactor_ids, &user.uuid, data, conn).await?, "2FA token not provided")
+            err_json!(
+                _json_err_twofactor(&twofactor_ids, &user.uuid, data, client_version, conn).await?,
+                "2FA token not provided"
+            )
         }
     };
 
@@ -585,7 +556,7 @@ async fn twofactor_auth(
                 }
                 _ => {
                     err_json!(
-                        _json_err_twofactor(&twofactor_ids, &user.uuid, data, conn).await?,
+                        _json_err_twofactor(&twofactor_ids, &user.uuid, data, client_version, conn).await?,
                         "2FA Remember token not provided"
                     )
                 }
@@ -617,6 +588,7 @@ async fn _json_err_twofactor(
     providers: &[i32],
     user_id: &UserId,
     data: &ConnectData,
+    client_version: &Option<ClientVersion>,
     conn: &mut DbConn,
 ) -> ApiResult<Value> {
     let mut result = json!({
@@ -689,8 +661,16 @@ async fn _json_err_twofactor(
                     err!("No twofactor email registered")
                 };
 
-                // Send email immediately if email is the only 2FA option
-                if providers.len() == 1 {
+                // Starting with version 2025.5.0 the client will call `/api/two-factor/send-email-login`.
+                let disabled_send = if let Some(cv) = client_version {
+                    let ver_match = semver::VersionReq::parse(">=2025.5.0").unwrap();
+                    ver_match.matches(&cv.0)
+                } else {
+                    false
+                };
+
+                // Send email immediately if email is the only 2FA option.
+                if providers.len() == 1 && !disabled_send {
                     email::send_token(user_id, conn).await?
                 }
 
